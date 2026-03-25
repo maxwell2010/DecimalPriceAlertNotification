@@ -70,10 +70,17 @@ python test_lab.py
 ```powershell
 pip install pyinstaller
 python -c "from main import ensure_icon_asset; ensure_icon_asset()"
-if (Test-Path dist) { Remove-Item dist -Recurse -Force }`nif (Test-Path build) { Remove-Item build -Recurse -Force }`npython -m PyInstaller --clean --noconfirm --onefile --windowed --name WindowsNotify --icon assets/icon.png main.py
+if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+if (Test-Path build) { Remove-Item build -Recurse -Force }
+python -m PyInstaller --clean --noconfirm --onefile --windowed --name WindowsNotify --icon assets/icon.png main.py
 ```
 
 Готовый файл: `dist\WindowsNotify.exe`
+
+## Авто-сборка в GitHub Actions
+
+- При пуше в `main` workflow собирает `WindowsNotify.exe` и публикует его как artifact.
+- При пуше тега вида `v*` (например, `v1.0.0`) workflow дополнительно прикрепляет `WindowsNotify.exe` к GitHub Release.
 
 ## Автозапуск
 
