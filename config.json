@@ -1,8 +1,0 @@
-{
-  "poll_interval_sec": 60,
-  "price_step_percent": 3.0,
-  "style": "ice",
-  "always_on_top": true,
-  "window_x": 181,
-  "window_y": 535
-}

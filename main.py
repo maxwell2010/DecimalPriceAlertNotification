@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -26,11 +28,22 @@ except ImportError:
 
 API_URL = "https://bit.team/trade/api/cmc/ticker"
 TARGET_PAIRS = ("DEL_USDT", "DEL_RUB")
-BASE_DIR = Path(__file__).resolve().parent
-STATE_PATH = BASE_DIR / "state.json"
-CONFIG_PATH = BASE_DIR / "config.json"
+
+
+def _resolve_user_data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        local_appdata = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return local_appdata / "WindowsNotify"
+    return Path(__file__).resolve().parent
+
+
+USER_DATA_DIR = _resolve_user_data_dir()
+USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_PATH = USER_DATA_DIR / "state.json"
+CONFIG_PATH = USER_DATA_DIR / "config.json"
 ICON_RENDER_URL = "https://assets.coinmarketrate.com/assets/coins/decimal/icon_decimal.png"
-ICON_PNG_PATH = BASE_DIR / "assets" / "icon.png"
+ICON_PNG_PATH = USER_DATA_DIR / "assets" / "icon.png"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_sec": 60,

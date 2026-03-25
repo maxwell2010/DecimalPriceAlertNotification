@@ -36,6 +36,14 @@
   - `https://assets.coinmarketrate.com/assets/coins/decimal/icon_decimal.png`
   - сохраняется локально в `assets/icon.png`.
 
+## Где хранятся настройки
+
+- При запуске через `python main.py`:
+  - `config.json` и `state.json` сохраняются в папке проекта.
+- При запуске через `WindowsNotify.exe`:
+  - данные сохраняются в `%LOCALAPPDATA%\WindowsNotify\`
+  - это сохраняет выбранную тему, порог алертов, позицию окна и интервал между перезапусками.
+
 ## Запуск
 
 ```powershell
@@ -62,7 +70,7 @@ python test_lab.py
 ```powershell
 pip install pyinstaller
 python -c "from main import ensure_icon_asset; ensure_icon_asset()"
-pyinstaller --noconfirm --onefile --windowed --name WindowsNotify --icon assets/icon.png main.py
+if (Test-Path dist) { Remove-Item dist -Recurse -Force }`nif (Test-Path build) { Remove-Item build -Recurse -Force }`npython -m PyInstaller --clean --noconfirm --onefile --windowed --name WindowsNotify --icon assets/icon.png main.py
 ```
 
 Готовый файл: `dist\WindowsNotify.exe`
@@ -71,3 +79,4 @@ pyinstaller --noconfirm --onefile --windowed --name WindowsNotify --icon assets/
 
 1. Нажать `Win + R` и выполнить `shell:startup`.
 2. Положить ярлык на `dist\WindowsNotify.exe` в эту папку.
+
