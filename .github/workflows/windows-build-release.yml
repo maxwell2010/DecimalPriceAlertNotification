@@ -14,6 +14,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
@@ -35,13 +37,17 @@ jobs:
         shell: pwsh
         run: |
           python -c "from main import ensure_icon_asset; print(ensure_icon_asset())"
+          if (-not (Test-Path assets/icon.ico)) {
+            python -c "from PIL import Image; Image.open('assets/icon.png').save('assets/icon.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
+          }
+          Get-ChildItem assets | Format-Table Name,Length,LastWriteTime -AutoSize
 
       - name: Build EXE
         shell: pwsh
         run: |
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           if (Test-Path build) { Remove-Item build -Recurse -Force }
-          python -m PyInstaller --clean --noconfirm --onefile --windowed --name WindowsNotify --icon assets/icon.png main.py
+          python -m PyInstaller --clean --noconfirm --onefile --windowed --name WindowsNotify --icon assets/icon.ico main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
