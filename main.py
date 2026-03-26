@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -346,6 +347,9 @@ class ToastNotifier:
                 self._toaster = None
         if Notify is not None:
             self.backend = "notifypy"
+            return
+        if os.name == "nt":
+            self.backend = "powershell-toast"
 
     def send(self, title: str, message: str) -> None:
         if self.backend == "windows-toasts" and self._toaster is not None and Toast is not None:
@@ -380,7 +384,48 @@ class ToastNotifier:
                 return
             except Exception:
                 pass
+        if self._send_powershell_toast(title, message):
+            return
         print(f"[notify] {title}: {message}")
+
+    @staticmethod
+    def _send_powershell_toast(title: str, message: str) -> bool:
+        if os.name != "nt":
+            return False
+        escaped_title = title.replace("'", "''")
+        escaped_message = message.replace("'", "''")
+        ps_script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$t = [System.Security.SecurityElement]::Escape('{escaped_title}')
+$m = [System.Security.SecurityElement]::Escape('{escaped_message}')
+$xmlTemplate = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>$t</text>
+      <text>$m</text>
+    </binding>
+  </visual>
+</toast>
+"@
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($xmlTemplate)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WindowsNotify')
+$notifier.Show($toast)
+"""
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+            return True
+        except Exception:
+            return False
 
 
 class PriceMonitor:
@@ -495,10 +540,11 @@ class PriceMonitor:
     def _build_snapshot(self, fetched: Dict[str, Any], previous_prices: Dict[str, float]) -> Dict[str, Any]:
         changes = {}
         for pair in TARGET_PAIRS:
-            changes[pair] = self._calc_change_percent(
-                fetched["prices"].get(pair, 0.0),
-                self._safe_float(previous_prices.get(pair, 0.0)),
-            )
+            current_raw = self._safe_float(fetched["prices"].get(pair, 0.0))
+            previous_raw = self._safe_float(previous_prices.get(pair, 0.0))
+            current_display = round(current_raw, 6)
+            previous_display = round(previous_raw, 6)
+            changes[pair] = self._calc_change_percent(current_display, previous_display)
         return {
             "prices": fetched["prices"],
             "pair_status": fetched["pair_status"],
@@ -525,11 +571,17 @@ class PriceMonitor:
                     float(cfg["price_step_percent"]),
                     anchors,
                 )
+                next_prices = fetched["prices"]
+                next_pair_status = fetched["pair_status"]
+            else:
+                # Keep last non-zero prices as baseline so % delta is meaningful after reconnect.
+                next_prices = previous_prices
+                next_pair_status = fetched["pair_status"]
 
             self._state = {
                 "exchange_online": snapshot["exchange_online"],
-                "last_prices": fetched["prices"],
-                "pair_status": fetched["pair_status"],
+                "last_prices": next_prices,
+                "pair_status": next_pair_status,
                 "alert_anchors": anchors,
                 "last_update": snapshot["last_update"],
                 "error": snapshot["error"],
@@ -609,7 +661,7 @@ class MonitorWidget(tk.Tk):
         self.header = tk.Frame(self.container, bd=0, highlightthickness=0)
         self.header.pack(fill="x")
 
-        self.title_label = tk.Label(self.header, text="DEL Monitor", font=("Segoe UI Semibold", 15), anchor="w")
+        self.title_label = tk.Label(self.header, text="", font=("Segoe UI Semibold", 15), anchor="w")
         self.title_label.pack(side="left")
 
         self.style_btn = tk.Button(
