@@ -45,6 +45,20 @@ STATE_PATH = USER_DATA_DIR / "state.json"
 CONFIG_PATH = USER_DATA_DIR / "config.json"
 ICON_RENDER_URL = "https://assets.coinmarketrate.com/assets/coins/decimal/icon_decimal.png"
 ICON_PNG_PATH = USER_DATA_DIR / "assets" / "icon.png"
+APP_VERSION = "v1.0.3"
+TOAST_APP_ID = "WindowsNotify.DELMonitor"
+TOAST_APP_NAME = "DEL Monitor"
+BROWSER_GET_HEADERS: Dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+}
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_sec": 60,
@@ -257,6 +271,12 @@ STYLE_LABELS: Dict[str, str] = {
 }
 
 
+def build_browser_get_headers(accept: str) -> Dict[str, str]:
+    headers = dict(BROWSER_GET_HEADERS)
+    headers["Accept"] = accept
+    return headers
+
+
 def ensure_icon_asset() -> Optional[Path]:
     try:
         ICON_PNG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -264,7 +284,7 @@ def ensure_icon_asset() -> Optional[Path]:
             return ICON_PNG_PATH
         req_png = Request(
             ICON_RENDER_URL,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DELMonitor/1.0"},
+            headers=build_browser_get_headers("image/avif,image/webp,image/apng,image/*,*/*;q=0.8"),
         )
         with urlopen(req_png, timeout=8) as resp_png:
             png_content = resp_png.read()
@@ -334,85 +354,136 @@ class ToastNotifier:
     def __init__(self, icon_path: Optional[Path] = None) -> None:
         self.backend = "stdout"
         self.icon_path = icon_path if icon_path and icon_path.exists() else None
+        self.app_id = TOAST_APP_ID
+        self.app_name = TOAST_APP_NAME
         self._toaster = None
         if win11toast_send is not None:
             self.backend = "win11toast"
             return
         if WindowsToaster is not None and Toast is not None:
             try:
-                self._toaster = WindowsToaster("DEL Monitor")
+                self._toaster = WindowsToaster(TOAST_APP_NAME)
                 self.backend = "windows-toasts"
                 return
             except Exception:
                 self._toaster = None
-        if Notify is not None:
-            self.backend = "notifypy"
-            return
         if os.name == "nt":
             self.backend = "powershell-toast"
+            return
+        if Notify is not None:
+            self.backend = "notifypy"
 
-    def send(self, title: str, message: str) -> None:
+    def send(
+        self,
+        title: str,
+        message: str,
+        *,
+        subtitle: Optional[str] = None,
+        scenario: str = "default",
+        tag: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> None:
         if self.backend == "windows-toasts" and self._toaster is not None and Toast is not None:
             try:
                 toast = Toast()
-                toast.text_fields = [title, message]
+                text_fields = [title]
+                if subtitle:
+                    text_fields.append(subtitle)
+                text_fields.append(message)
+                toast.text_fields = text_fields[:3]
                 self._toaster.show_toast(toast)
                 return
             except Exception:
                 pass
         if self.backend == "win11toast" and win11toast_send is not None:
             try:
+                full_message = f"{subtitle}\n{message}" if subtitle else message
                 if self.icon_path is not None:
                     try:
-                        win11toast_send(title, message, icon=str(self.icon_path))
+                        win11toast_send(title, full_message, icon=str(self.icon_path))
                         return
                     except Exception:
                         pass
-                win11toast_send(title, message)
+                win11toast_send(title, full_message)
                 return
             except Exception:
                 pass
         if Notify is not None:
             try:
                 notification = Notify()
-                notification.application_name = "DEL Monitor"
+                notification.application_name = self.app_name
                 notification.title = title
-                notification.message = message
+                notification.message = f"{subtitle}\n{message}" if subtitle else message
                 if self.icon_path is not None:
                     notification.icon = str(self.icon_path)
                 notification.send()
                 return
             except Exception:
                 pass
-        if self._send_powershell_toast(title, message):
+        if self._send_powershell_toast(
+            title,
+            message,
+            subtitle=subtitle,
+            scenario=scenario,
+            tag=tag,
+            group=group,
+        ):
             return
         print(f"[notify] {title}: {message}")
 
-    @staticmethod
-    def _send_powershell_toast(title: str, message: str) -> bool:
+    def _send_powershell_toast(
+        self,
+        title: str,
+        message: str,
+        *,
+        subtitle: Optional[str] = None,
+        scenario: str = "default",
+        tag: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> bool:
         if os.name != "nt":
             return False
+        scenario = scenario if scenario in {"default", "alarm", "reminder", "incomingCall"} else "default"
         escaped_title = title.replace("'", "''")
+        escaped_subtitle = (subtitle or "").replace("'", "''")
         escaped_message = message.replace("'", "''")
+        escaped_tag = (tag or "").replace("'", "''")
+        escaped_group = (group or "").replace("'", "''")
+        escaped_app_id = self.app_id.replace("'", "''")
+        escaped_icon_uri = ""
+        if self.icon_path is not None and self.icon_path.exists():
+            escaped_icon_uri = self.icon_path.resolve().as_uri().replace("'", "''")
+        scenario_attr = f' scenario="{scenario}"' if scenario != "default" else ""
+        subtitle_xml = "      <text>$s</text>\n" if subtitle else ""
+        icon_xml = ""
+        if escaped_icon_uri:
+            icon_xml = '      <image placement="appLogoOverride" hint-crop="circle" src="$i"/>\n'
+        tag_block = "$toast.Tag = $tag\n" if tag else ""
+        group_block = "$toast.Group = $group\n" if group else ""
         ps_script = f"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
 $t = [System.Security.SecurityElement]::Escape('{escaped_title}')
+$s = [System.Security.SecurityElement]::Escape('{escaped_subtitle}')
 $m = [System.Security.SecurityElement]::Escape('{escaped_message}')
+$i = '{escaped_icon_uri}'
+$tag = '{escaped_tag}'
+$group = '{escaped_group}'
 $xmlTemplate = @"
-<toast>
+<toast{scenario_attr}>
   <visual>
     <binding template="ToastGeneric">
       <text>$t</text>
-      <text>$m</text>
-    </binding>
+{subtitle_xml}      <text>$m</text>
+{icon_xml}    </binding>
   </visual>
+  <audio src="ms-winsoundevent:Notification.Default"/>
 </toast>
 "@
 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
 $xml.LoadXml($xmlTemplate)
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WindowsNotify')
+{tag_block}{group_block}$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{escaped_app_id}')
 $notifier.Show($toast)
 """
         try:
@@ -465,9 +536,7 @@ class PriceMonitor:
         try:
             req = Request(
                 API_URL,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DELMonitor/1.0"
-                },
+                headers=build_browser_get_headers("application/json,text/plain,*/*"),
             )
             with urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode("utf-8")
@@ -506,9 +575,22 @@ class PriceMonitor:
         if previous is None or previous == current:
             return
         if current:
-            self.notifier.send("DEL Monitor", "Биржа снова доступна: котировки обновляются.")
+            self.notifier.send(
+                "DEL Monitor",
+                "Котировки снова обновляются.",
+                subtitle="Статус биржи: ONLINE",
+                tag="status-online",
+                group="status",
+            )
             return
-        self.notifier.send("DEL Monitor", "Биржа недоступна: обновления временно остановлены.")
+        self.notifier.send(
+            "DEL Monitor",
+            "Обновления временно остановлены.",
+            subtitle="Статус биржи: OFFLINE",
+            scenario="reminder",
+            tag="status-offline",
+            group="status",
+        )
 
     def _notify_price_steps(
         self,
@@ -528,11 +610,15 @@ class PriceMonitor:
             diff_percent = self._calc_change_percent(current, anchor)
             if abs(diff_percent) < threshold_percent:
                 continue
-            direction = "рост" if diff_percent > 0 else "падение"
+            direction = "Рост" if diff_percent > 0 else "Падение"
             sign = "+" if diff_percent > 0 else ""
             self.notifier.send(
-                "DEL Monitor",
-                f"{pair}: {direction} {sign}{diff_percent:.1f}% | цена {current:.6f}",
+                f"{pair} {sign}{diff_percent:.1f}%",
+                f"Текущая цена: {current:.6f}",
+                subtitle=f"{direction} от {anchor:.6f}",
+                scenario="reminder",
+                tag=pair,
+                group="price",
             )
             next_anchors[pair] = current
         return next_anchors
@@ -718,8 +804,12 @@ class MonitorWidget(tk.Tk):
                 "change": change_label,
             }
 
-        self.footer = tk.Label(self.container, text="Updated: n/a", font=("Segoe UI", 8), anchor="w")
-        self.footer.pack(fill="x", pady=(12, 0))
+        self.footer_bar = tk.Frame(self.container, bd=0, highlightthickness=0)
+        self.footer_bar.pack(fill="x", pady=(12, 0))
+        self.footer = tk.Label(self.footer_bar, text="Updated: n/a", font=("Segoe UI", 8), anchor="w")
+        self.footer.pack(side="left", fill="x", expand=True)
+        self.footer_version = tk.Label(self.footer_bar, text=f"Release: {APP_VERSION}", font=("Segoe UI", 8), anchor="e")
+        self.footer_version.pack(side="right")
 
         self.bind("<ButtonPress-1>", self.start_drag)
         self.bind("<B1-Motion>", self.on_drag)
@@ -787,7 +877,9 @@ class MonitorWidget(tk.Tk):
             activebackground=button_bg,
             activeforeground=self.theme["fg"],
         )
+        self.footer_bar.configure(bg=self.theme["card_bg"])
         self.footer.configure(bg=self.theme["card_bg"], fg=self.theme["sub_fg"])
+        self.footer_version.configure(bg=self.theme["card_bg"], fg=self.theme["sub_fg"])
         for row_items in self.rows.values():
             row_items["row"].configure(bg=row_bg)
             row_items["pair"].configure(bg=row_bg, fg=self.theme["sub_fg"])
@@ -830,6 +922,7 @@ class MonitorWidget(tk.Tk):
         if snap.get("error"):
             footer_text = f"{footer_text} | err"
         self.footer.configure(text=footer_text)
+        self.footer_version.configure(text=f"Release: {APP_VERSION}")
         step_percent = float(self.config_manager.get().get("price_step_percent", 1.0))
         self.threshold_btn.configure(text=f"Alert >= {step_percent:.1f}%")
 
