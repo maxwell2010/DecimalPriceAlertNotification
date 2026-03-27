@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+dist_v103/
 *.spec
 config.json
 state.json

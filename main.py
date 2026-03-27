@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from tkinter import messagebox, simpledialog
 from typing import Any, Dict, Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+import winreg
 
 try:
     from windows_toasts import Toast, WindowsToaster
@@ -21,6 +23,11 @@ try:
     from win11toast import toast as win11toast_send
 except ImportError:
     win11toast_send = None
+
+try:
+    from win10toast import ToastNotifier as Win10ToastClient
+except ImportError:
+    Win10ToastClient = None
 
 try:
     from notifypy import Notify
@@ -45,7 +52,7 @@ STATE_PATH = USER_DATA_DIR / "state.json"
 CONFIG_PATH = USER_DATA_DIR / "config.json"
 ICON_RENDER_URL = "https://assets.coinmarketrate.com/assets/coins/decimal/icon_decimal.png"
 ICON_PNG_PATH = USER_DATA_DIR / "assets" / "icon.png"
-APP_VERSION = "v1.0.3"
+APP_VERSION = "v1.0.4"
 TOAST_APP_ID = "WindowsNotify.DELMonitor"
 TOAST_APP_NAME = "DEL Monitor"
 BROWSER_GET_HEADERS: Dict[str, str] = {
@@ -356,10 +363,10 @@ class ToastNotifier:
         self.icon_path = icon_path if icon_path and icon_path.exists() else None
         self.app_id = TOAST_APP_ID
         self.app_name = TOAST_APP_NAME
+        self.last_transport = "none"
+        self.last_error: Optional[str] = None
         self._toaster = None
-        if win11toast_send is not None:
-            self.backend = "win11toast"
-            return
+        self._win10_toaster = None
         if WindowsToaster is not None and Toast is not None:
             try:
                 self._toaster = WindowsToaster(TOAST_APP_NAME)
@@ -367,8 +374,15 @@ class ToastNotifier:
                 return
             except Exception:
                 self._toaster = None
+        if Win10ToastClient is not None and os.name == "nt":
+            try:
+                self._win10_toaster = Win10ToastClient()
+                self.backend = "win10toast"
+                return
+            except Exception:
+                self._win10_toaster = None
         if os.name == "nt":
-            self.backend = "powershell-toast"
+            self.backend = "powershell-balloon"
             return
         if Notify is not None:
             self.backend = "notifypy"
@@ -382,7 +396,8 @@ class ToastNotifier:
         scenario: str = "default",
         tag: Optional[str] = None,
         group: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
+        self.last_error = None
         if self.backend == "windows-toasts" and self._toaster is not None and Toast is not None:
             try:
                 toast = Toast()
@@ -392,8 +407,10 @@ class ToastNotifier:
                 text_fields.append(message)
                 toast.text_fields = text_fields[:3]
                 self._toaster.show_toast(toast)
-                return
-            except Exception:
+                self.last_transport = "windows-toasts"
+                return True
+            except Exception as exc:
+                self.last_error = f"windows-toasts: {exc}"
                 pass
         if self.backend == "win11toast" and win11toast_send is not None:
             try:
@@ -401,12 +418,32 @@ class ToastNotifier:
                 if self.icon_path is not None:
                     try:
                         win11toast_send(title, full_message, icon=str(self.icon_path))
-                        return
-                    except Exception:
+                        self.last_transport = "win11toast"
+                        return True
+                    except Exception as exc:
+                        self.last_error = f"win11toast(icon): {exc}"
                         pass
                 win11toast_send(title, full_message)
-                return
-            except Exception:
+                self.last_transport = "win11toast"
+                return True
+            except Exception as exc:
+                self.last_error = f"win11toast: {exc}"
+                pass
+        if self.backend == "win10toast" and self._win10_toaster is not None:
+            try:
+                full_message = f"{subtitle}\n{message}" if subtitle else message
+                icon_path = str(self.icon_path) if self.icon_path is not None else None
+                self._win10_toaster.show_toast(
+                    title,
+                    full_message,
+                    icon_path=icon_path,
+                    duration=6,
+                    threaded=True,
+                )
+                self.last_transport = "win10toast"
+                return True
+            except Exception as exc:
+                self.last_error = f"win10toast: {exc}"
                 pass
         if Notify is not None:
             try:
@@ -417,19 +454,42 @@ class ToastNotifier:
                 if self.icon_path is not None:
                     notification.icon = str(self.icon_path)
                 notification.send()
-                return
-            except Exception:
+                self.last_transport = "notifypy"
+                return True
+            except Exception as exc:
+                self.last_error = f"notifypy: {exc}"
                 pass
-        if self._send_powershell_toast(
-            title,
-            message,
-            subtitle=subtitle,
-            scenario=scenario,
-            tag=tag,
-            group=group,
-        ):
-            return
+        if self.backend == "powershell-balloon":
+            if self._send_powershell_balloon(title, message, subtitle=subtitle):
+                self.last_transport = "powershell-balloon"
+                return True
+            if self._send_powershell_toast(
+                title,
+                message,
+                subtitle=subtitle,
+                scenario=scenario,
+                tag=tag,
+                group=group,
+            ):
+                self.last_transport = "powershell-toast"
+                return True
+        else:
+            if self._send_powershell_toast(
+                title,
+                message,
+                subtitle=subtitle,
+                scenario=scenario,
+                tag=tag,
+                group=group,
+            ):
+                self.last_transport = "powershell-toast"
+                return True
+            if self._send_powershell_balloon(title, message, subtitle=subtitle):
+                self.last_transport = "powershell-balloon"
+                return True
+        self.last_transport = "stdout"
         print(f"[notify] {title}: {message}")
+        return False
 
     def _send_powershell_toast(
         self,
@@ -495,7 +555,47 @@ $notifier.Show($toast)
                 timeout=8,
             )
             return True
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"powershell-toast: {exc}"
+            return False
+
+    def _send_powershell_balloon(
+        self,
+        title: str,
+        message: str,
+        *,
+        subtitle: Optional[str] = None,
+    ) -> bool:
+        if os.name != "nt":
+            return False
+        escaped_title = title.replace("'", "''")
+        escaped_message = message.replace("'", "''")
+        escaped_subtitle = (subtitle or "").replace("'", "''")
+        full_message = escaped_message if not escaped_subtitle else f"{escaped_subtitle} | {escaped_message}"
+        ps_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$n = New-Object System.Windows.Forms.NotifyIcon
+$n.Icon = [System.Drawing.SystemIcons]::Information
+$n.Visible = $true
+$n.BalloonTipTitle = '{escaped_title}'
+$n.BalloonTipText = '{full_message}'
+$n.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+$n.ShowBalloonTip(4000)
+Start-Sleep -Milliseconds 1200
+$n.Dispose()
+"""
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+            return True
+        except Exception as exc:
+            self.last_error = f"powershell-balloon: {exc}"
             return False
 
 
@@ -522,6 +622,8 @@ class PriceMonitor:
                 "error": None,
             },
         )
+        self._consecutive_failures = 0
+        self._soft_failure_limit = 2
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -532,38 +634,45 @@ class PriceMonitor:
         except (TypeError, ValueError):
             return 0.0
 
-    def _fetch_prices(self) -> Dict[str, Any]:
-        try:
-            req = Request(
-                API_URL,
-                headers=build_browser_get_headers("application/json,text/plain,*/*"),
-            )
-            with urlopen(req, timeout=15) as resp:
-                raw = resp.read().decode("utf-8")
-            payload = json.loads(raw)
-            prices: Dict[str, float] = {}
-            pair_status: Dict[str, bool] = {}
-            for pair in TARGET_PAIRS:
-                value = self._safe_float((payload.get(pair) or {}).get("last_price", 0))
-                is_ok = value > 0
-                prices[pair] = value
-                pair_status[pair] = is_ok
-            online = all(pair_status.values())
-            return {
-                "ok": True,
-                "prices": prices,
-                "pair_status": pair_status,
-                "exchange_online": online,
-                "error": None,
-            }
-        except (URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
-            return {
-                "ok": False,
-                "prices": {pair: 0.0 for pair in TARGET_PAIRS},
-                "pair_status": {pair: False for pair in TARGET_PAIRS},
-                "exchange_online": False,
-                "error": str(exc),
-            }
+    def _fetch_prices(self, retries: int = 3, retry_delay: float = 1.0) -> Dict[str, Any]:
+        last_error: Optional[Exception] = None
+        for attempt in range(max(1, retries)):
+            try:
+                req = Request(
+                    API_URL,
+                    headers=build_browser_get_headers("application/json,text/plain,*/*"),
+                )
+                with urlopen(req, timeout=15) as resp:
+                    raw = resp.read().decode("utf-8")
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError(f"Unexpected payload type: {type(payload).__name__}")
+                prices: Dict[str, float] = {}
+                pair_status: Dict[str, bool] = {}
+                for pair in TARGET_PAIRS:
+                    value = self._safe_float((payload.get(pair) or {}).get("last_price", 0))
+                    is_ok = value > 0
+                    prices[pair] = value
+                    pair_status[pair] = is_ok
+                online = all(pair_status.values())
+                return {
+                    "ok": True,
+                    "prices": prices,
+                    "pair_status": pair_status,
+                    "exchange_online": online,
+                    "error": None,
+                }
+            except Exception as exc:
+                last_error = exc
+                if attempt < retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+        return {
+            "ok": False,
+            "prices": {pair: 0.0 for pair in TARGET_PAIRS},
+            "pair_status": {pair: False for pair in TARGET_PAIRS},
+            "exchange_online": False,
+            "error": str(last_error) if last_error else "unknown error",
+        }
 
     @staticmethod
     def _calc_change_percent(current: float, base: float) -> float:
@@ -642,41 +751,78 @@ class PriceMonitor:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            cfg = self.config.get()
-            fetched = self._fetch_prices()
-            previous_online = self._state.get("exchange_online")
-            previous_prices = dict(self._state.get("last_prices", {}))
+            try:
+                cfg = self.config.get()
+                fetched = self._fetch_prices()
+                previous_online = self._state.get("exchange_online")
+                previous_prices = dict(self._state.get("last_prices", {}))
+                previous_pair_status = dict(self._state.get("pair_status", {}))
 
-            snapshot = self._build_snapshot(fetched, previous_prices)
-            self._notify_status_change(previous_online, snapshot["exchange_online"])
+                if fetched["ok"]:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    is_soft_failure = (
+                        previous_online is True and self._consecutive_failures < self._soft_failure_limit
+                    )
+                    if is_soft_failure:
+                        # Short SSL/handshake drops happen; keep ONLINE status on first miss.
+                        fetched["exchange_online"] = True
+                        fetched["prices"] = previous_prices or fetched["prices"]
+                        fetched["pair_status"] = previous_pair_status or fetched["pair_status"]
 
-            anchors = dict(self._state.get("alert_anchors", {}))
-            if fetched["exchange_online"]:
-                anchors = self._notify_price_steps(
-                    fetched["prices"],
-                    float(cfg["price_step_percent"]),
-                    anchors,
-                )
-                next_prices = fetched["prices"]
-                next_pair_status = fetched["pair_status"]
-            else:
-                # Keep last non-zero prices as baseline so % delta is meaningful after reconnect.
-                next_prices = previous_prices
-                next_pair_status = fetched["pair_status"]
+                snapshot = self._build_snapshot(fetched, previous_prices)
+                self._notify_status_change(previous_online, snapshot["exchange_online"])
 
-            self._state = {
-                "exchange_online": snapshot["exchange_online"],
-                "last_prices": next_prices,
-                "pair_status": next_pair_status,
-                "alert_anchors": anchors,
-                "last_update": snapshot["last_update"],
-                "error": snapshot["error"],
-            }
-            JsonStore.save(self.state_path, self._state)
-            self.on_update(snapshot)
+                anchors = dict(self._state.get("alert_anchors", {}))
+                if fetched["exchange_online"]:
+                    anchors = self._notify_price_steps(
+                        fetched["prices"],
+                        float(cfg["price_step_percent"]),
+                        anchors,
+                    )
+                    next_prices = fetched["prices"]
+                    next_pair_status = fetched["pair_status"]
+                else:
+                    # Keep last non-zero prices as baseline so % delta is meaningful after reconnect.
+                    next_prices = previous_prices
+                    next_pair_status = fetched["pair_status"]
 
-            interval = max(15, int(cfg["poll_interval_sec"]))
-            self._stop_event.wait(timeout=interval)
+                self._state = {
+                    "exchange_online": snapshot["exchange_online"],
+                    "last_prices": next_prices,
+                    "pair_status": next_pair_status,
+                    "alert_anchors": anchors,
+                    "last_update": snapshot["last_update"],
+                    "error": snapshot["error"],
+                }
+                JsonStore.save(self.state_path, self._state)
+                self.on_update(snapshot)
+
+                interval = max(15, int(cfg["poll_interval_sec"]))
+                self._stop_event.wait(timeout=interval)
+            except Exception as exc:
+                # Never allow background worker to die silently.
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                fallback_snapshot = {
+                    "prices": dict(self._state.get("last_prices", {})),
+                    "pair_status": dict(self._state.get("pair_status", {})),
+                    "exchange_online": bool(self._state.get("exchange_online", False)),
+                    "last_update": now,
+                    "changes": {pair: 0.0 for pair in TARGET_PAIRS},
+                    "error": f"monitor loop error: {exc}",
+                }
+                self._state["error"] = fallback_snapshot["error"]
+                self._state["last_update"] = now
+                try:
+                    JsonStore.save(self.state_path, self._state)
+                except Exception:
+                    pass
+                try:
+                    self.on_update(fallback_snapshot)
+                except Exception:
+                    pass
+                self._stop_event.wait(timeout=5)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -689,6 +835,9 @@ class PriceMonitor:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
 
 class MonitorWidget(tk.Tk):
@@ -710,6 +859,7 @@ class MonitorWidget(tk.Tk):
         self.drag_start = (0, 0)
         self.icon_path = ensure_icon_asset()
         self._icon_image = None
+        self.monitor_watchdog_enabled = True
 
         self._build_window()
         self._build_ui()
@@ -747,22 +897,21 @@ class MonitorWidget(tk.Tk):
         self.header = tk.Frame(self.container, bd=0, highlightthickness=0)
         self.header.pack(fill="x")
 
-        self.title_label = tk.Label(self.header, text="", font=("Segoe UI Semibold", 15), anchor="w")
-        self.title_label.pack(side="left")
+        for col in range(3):
+            self.header.grid_columnconfigure(col, weight=1, uniform="header-buttons")
 
-        self.style_btn = tk.Button(
+        self.notify_btn = tk.Button(
             self.header,
-            text="Style",
+            text="Enable Notify",
             font=("Segoe UI", 9),
             relief="flat",
             bd=0,
-            command=self.cycle_style,
+            command=self.enable_notifications,
             cursor="hand2",
             padx=10,
             pady=3,
-            width=14,
         )
-        self.style_btn.pack(side="right")
+        self.notify_btn.grid(row=0, column=0, padx=(0, 3), sticky="ew")
 
         self.threshold_btn = tk.Button(
             self.header,
@@ -775,7 +924,20 @@ class MonitorWidget(tk.Tk):
             padx=10,
             pady=3,
         )
-        self.threshold_btn.pack(side="right", padx=(0, 6))
+        self.threshold_btn.grid(row=0, column=1, padx=3, sticky="ew")
+
+        self.style_btn = tk.Button(
+            self.header,
+            text="Style",
+            font=("Segoe UI", 9),
+            relief="flat",
+            bd=0,
+            command=self.cycle_style,
+            cursor="hand2",
+            padx=10,
+            pady=3,
+        )
+        self.style_btn.grid(row=0, column=2, padx=(3, 0), sticky="ew")
 
         self.status_chip = tk.Label(
             self.container,
@@ -826,6 +988,7 @@ class MonitorWidget(tk.Tk):
         self.popup.add_command(label="Set threshold %", command=self.set_threshold)
         self.popup.add_command(label="Set interval sec", command=self.set_interval)
         self.popup.add_command(label="Toggle topmost", command=self.toggle_topmost)
+        self.popup.add_command(label="Windows notifications", command=self.open_notifications_settings)
         self.popup.add_separator()
         self.style_menu = tk.Menu(self.popup, tearoff=0)
         for style_name in STYLE_PRESETS:
@@ -849,6 +1012,8 @@ class MonitorWidget(tk.Tk):
         if snapshot:
             self.latest_snapshot = snapshot
             self.render()
+        if self.monitor_watchdog_enabled and not self.monitor.is_running():
+            self.monitor.start()
         self.after(300, self.consume_snapshot)
 
     def apply_style(self) -> None:
@@ -862,8 +1027,13 @@ class MonitorWidget(tk.Tk):
         self.configure(bg=self.theme["root_bg"])
         self.container.configure(bg=self.theme["card_bg"])
         self.header.configure(bg=self.theme["card_bg"])
-        self.title_label.configure(bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.status_chip.configure(bg=self.theme["root_bg"], fg=self.theme["chip_fg"])
+        self.notify_btn.configure(
+            bg=button_bg,
+            fg=self.theme["fg"],
+            activebackground=button_bg,
+            activeforeground=self.theme["fg"],
+        )
         self.style_btn.configure(
             bg=button_bg,
             fg=self.theme["fg"],
@@ -959,6 +1129,59 @@ class MonitorWidget(tk.Tk):
         next_value = not bool(self.config_manager.get()["always_on_top"])
         self.config_manager.update({"always_on_top": next_value})
         self.attributes("-topmost", next_value)
+
+    @staticmethod
+    def open_notifications_settings() -> None:
+        if os.name != "nt":
+            return
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", "ms-settings:notifications"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def enable_notifications(self) -> None:
+        if os.name != "nt":
+            messagebox.showinfo("Enable Notify", "This action is available only on Windows.")
+            return
+        changed: list[str] = []
+        failed: list[str] = []
+
+        def set_dword(path: str, name: str, value: int) -> None:
+            try:
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, path)
+                with key:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+                changed.append(f"{path}\\{name}={value}")
+            except OSError as exc:
+                failed.append(f"{path}\\{name}: {exc}")
+
+        set_dword(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled", 1)
+
+        app_paths = [
+            r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\DEL Monitor",
+            r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Python Application (notify.py)",
+        ]
+        for app_path in app_paths:
+            set_dword(app_path, "Enabled", 1)
+            set_dword(app_path, "ShowBanner", 1)
+            set_dword(app_path, "ShowInActionCenter", 1)
+            set_dword(app_path, "ShowPopup", 1)
+
+        if failed:
+            messagebox.showwarning(
+                "Enable Notify",
+                "Часть параметров не удалось применить.\n\n"
+                f"Успешно: {len(changed)}\nОшибок: {len(failed)}",
+            )
+        else:
+            messagebox.showinfo(
+                "Enable Notify",
+                "Уведомления включены для DEL Monitor и Python Application (notify.py).",
+            )
 
     def set_style(self, style: str) -> None:
         self.config_manager.update({"style": style})
